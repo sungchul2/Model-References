@@ -103,7 +103,7 @@ class HPUModel:  # TODO add warm up iteration
     def __call__(self,
                  data: torch.Tensor, measurement='latency'):
         latency_timer = time.time()
-        data = data.to(device=HPU, non_blocking=True)
+        data = data.to(device=HPU, non_blocking=True, dtype=self.dtype)
         with torch.autocast(device_type="hpu", dtype=self.dtype, enabled=(self.dtype != torch.float32), cache_enabled=False):
             output = self.model(data)
             if measurement == 'latency':
@@ -181,10 +181,10 @@ class HPUJITModel(HPUModel):
             self._trace(example_input)
 
     def _trace(self, example_input):
-        example_input.to(device=HPU)
+        example_input.to(device=HPU, dtype=self.dtype)
         with torch.no_grad():
             with torch.autocast(device_type="hpu", dtype=self.dtype, enabled=(self.dtype != torch.float32), cache_enabled=False):
-                self.model = torch.jit.trace(self.model, example_input, check_trace=False, strict=False)
+                self.model = torch.jit.trace(self.model, example_input.to(device=HPU, dtype=self.dtype), check_trace=False, strict=False)
 
 
 class HPUGraphModel(HPUModel):
@@ -259,9 +259,9 @@ def main(model_type: type,
     with torch.no_grad():
         example_input = torch.ones((batch_size, 3, 224, 224), device="cpu")
 
-    pretrained=True
-    if os.path.isfile(ckpt_pth) or os.path.isfile(quant_model_pth):
-        pretrained=False
+    pretrained=False
+    # if os.path.isfile(ckpt_pth) or os.path.isfile(quant_model_pth):
+    #     pretrained=False
     if use_compile_mode:
         if os.environ.get('PT_HPU_LAZY_MODE') is None:
             sys.exit("Please use PT_HPU_LAZY_MODE=0 in the command line for torch.compile")
@@ -270,7 +270,7 @@ def main(model_type: type,
         if not model_type is HPUModel:
             sys.exit("Please use HPUModel as the modeltype in the command line for torch.compile")
 
-    model = model_type(model_def(pretrained=pretrained), parameters_path=ckpt_pth,
+    model = model_type(model_def(pretrained=pretrained), parameters_path=None,
         example_input=example_input, dtype=model_dtype, quant_model_path=quant_model_pth, compile_mode=use_compile_mode)
     if run_benchmarks:
         benchmarks = model.benchmark(data_loader, run_with_profiler)
