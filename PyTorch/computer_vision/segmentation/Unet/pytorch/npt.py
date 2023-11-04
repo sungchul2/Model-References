@@ -39,7 +39,13 @@ def set_env_params(args):
 
 def distribute_execution(rank, size, hparams):
     model = hparams.model
-    hparams.opt_dict = model.configure_optimizers()
+    if hparams.args.model == "unet":
+        hparams.opt_dict = model.configure_optimizers()
+    else:
+        from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+        hparams.opt_dict = {}
+        hparams.opt_dict["optimizer"] = FusedAdamW(
+            model.parameters(), lr=hparams.args.learning_rate, eps=1e-08, weight_decay=hparams.args.weight_decay)
 
     trainer = hparams.trainer
     if hparams.args.benchmark:
@@ -65,7 +71,12 @@ def init_processes(rank, world_size, hparams, fn, backend='hccl'):
     dist._DEFAULT_FIRST_BUCKET_BYTES = 200*1024*1024  #200MB
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     set_seed(hparams.args.model_seed)
-    hparams.model = NNUnet(hparams.args)
+    if hparams.args.model == "unet":
+        hparams.model = NNUnet(hparams.args)
+    else:
+        from mmseg.models import build_segmentor
+        from train_litehrnet import config
+        hparams.model = build_segmentor(config[hparams.args.model])
     fn(rank, world_size, hparams)
 
 def nptrun(args):
