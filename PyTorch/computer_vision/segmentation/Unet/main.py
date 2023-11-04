@@ -164,6 +164,7 @@ def get_main_args(strings=None):
     arg('--no-augment', dest='augment', action='store_false')
     arg("--measurement_type", type=str, choices=["throughput", "latency"], default="throughput", help="Measurement mode for inference benchmark")
     arg("--use_torch_compile", action="store_true", help="Enable torch.compile")
+    arg("--model", type=str, default="unet", choices=["unet", "ocr_lite_hrnet_s_mod2", "ocr_lite_hrnet_18_mod2"])
     parser.set_defaults(augment=True)
 
     if strings is not None:
