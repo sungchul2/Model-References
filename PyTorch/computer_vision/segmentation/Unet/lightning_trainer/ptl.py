@@ -132,7 +132,7 @@ def ptlrun(args):
 
     seed_everything(seed0)
     set_seed(data_module_seed)
-    if args.model == "unet":
+    if args.dataset == "brats":
         data_module = DataModule(args)
     else:
         data_module = LiteHRNetDataModule(args)

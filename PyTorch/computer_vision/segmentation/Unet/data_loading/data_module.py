@@ -175,7 +175,8 @@ class LiteHRNetDataModule(DataModule):
             imgs=self.train_imgs,
             masks=self.train_lbls,
             batch_size=self.args.batch_size,
-            mode="train")
+            mode="train",
+            **self.kwargs)
 
     def val_dataloader(self):
         return fetch_habana_loader(
@@ -183,7 +184,8 @@ class LiteHRNetDataModule(DataModule):
             imgs=self.val_imgs,
             masks=self.val_lbls,
             batch_size=1,
-            mode="val")
+            mode="val",
+            **self.kwargs)
             
             
 def fetch_habana_loader(args, imgs, masks, batch_size, mode, **kwargs):
