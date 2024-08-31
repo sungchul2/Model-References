@@ -51,6 +51,8 @@ from utils.utils import (
 from models.loss import Loss
 from models.metrics import Dice
 from models.unet import UNet
+from config.otx_litehrnet import config
+from mmseg.models import build_segmentor
 
 from lightning_utilities import module_available
 if module_available("lightning"):
@@ -387,3 +389,160 @@ class NNUnet(pl.LightningModule if os.getenv('framework')=='PTL' else nn.Module)
         if self.args.hpus:
             img, lbl = img.to(torch.device("hpu"), non_blocking=False), lbl.to(torch.device("hpu"), non_blocking=False)
         return img, lbl
+    
+    
+class LiteHRNet(NNUnet):
+    def __init__(self, args):
+        super(NNUnet, self).__init__()
+        self.validation_step_outputs = []
+        self.args = args
+        self.n_class = 19 if self.args.dataset == "kitti" else 4
+        if not hasattr(self.args, "drop_block"):  # For backward compability
+            self.args.drop_block = False
+        if hasattr(self, 'save_hyperparameters'): #Pytorch and PTL compatibility
+            self.save_hyperparameters()
+        self.build_nnunet(self.args.dataset)
+        self.loss = nn.CrossEntropyLoss()
+        self.dice = Dice(self.n_class)
+        if hasattr(self.args, 'use_torch_compile') and self.args.use_torch_compile:
+            self.loss = torch.compile(self.loss, backend="aot_hpu_training_backend")
+            self.dice = torch.compile(self.dice, backend="aot_hpu_training_backend")
+        self.first = True
+        self.best_sum = 0
+        self.best_sum_epoch = 0
+        self.best_dice = self.n_class * [0]
+        self.best_epoch = self.n_class * [0]
+        self.best_sum_dice = self.n_class * [0]
+        self.learning_rate = args.learning_rate
+        self.tta_flips = get_tta_flips(args.dim)
+        self.test_idx = 0
+        self.test_imgs = []
+        if self.args.exec_mode in ["train", "evaluate"]:
+            self.dllogger = get_dllogger(args.results)
+        self.window_size = 20
+        self.train_loss_valid_end = 0
+        self.train_loss = torch.zeros(self.window_size, device=torch.device(get_device_str(self.args)))
+        
+    def build_nnunet(self, dataset="brats"):
+        class _LiteHRNet(nn.Module):
+            img_meta = {
+                "kitti": [{
+                    'ori_shape': (375, 1241, 3),
+                    'pad_shape': (512, 512, 3),
+                    'ori_filename': 'Dataset item index 142',
+                    'filename': 'Dataset item index 142',
+                    'scale_factor': np.array([1., 1., 1., 1.], dtype=np.float32),
+                    'flip': False,
+                    'img_norm_cfg': {
+                        'mean': np.array([123.675, 116.28, 103.53], dtype=np.float32),
+                        'std': np.array([58.395, 57.12, 57.375], dtype=np.float32),
+                        'to_rgb': False
+                    },
+                    'ignored_labels': np.array([], dtype=np.float64),
+                    'img_shape': (512, 512, 3)
+                }],
+                "brats": [{
+                    'ori_shape': (192, 160, 3),
+                    'pad_shape': (512, 512, 3),
+                    'ori_filename': 'Dataset item index 142',
+                    'filename': 'Dataset item index 142',
+                    'scale_factor': np.array([1., 1., 1., 1.], dtype=np.float32),
+                    'flip': False,
+                    'img_norm_cfg': {
+                        'mean': np.array([123.675, 116.28, 103.53], dtype=np.float32),
+                        'std': np.array([58.395, 57.12, 57.375], dtype=np.float32),
+                        'to_rgb': False
+                    },
+                    'ignored_labels': np.array([], dtype=np.float64),
+                    'img_shape': (512, 512, 3)
+                }]
+            }
+            def __init__(self, segmentor, dataset):
+                super().__init__()
+                self.segmentor = segmentor
+                self.dataset = dataset
+                
+            def forward(self, x):
+                rescale = not self.training
+                if not self.training and self.dataset == "kitti":
+                    x = x.transpose(2, 3).transpose(1, 2)
+                    x -= torch.tensor([[123.675, 116.28, 103.53]], dtype=x.dtype, device=x.device)
+                    x /= torch.tensor([[58.395, 57.12, 57.375]], dtype=x.dtype, device=x.device)
+                return self.segmentor.whole_inference(
+                    img=x,
+                    img_meta=self.img_meta[self.dataset],
+                    rescale=rescale)
+        
+        if dataset == "brats":
+            config[self.args.model]["decode_head"]["num_classes"] = self.n_class
+        segmentor = build_segmentor(config[self.args.model])
+        self.model = _LiteHRNet(segmentor, dataset)
+        if hasattr(self.args, 'use_torch_compile') and self.args.use_torch_compile:
+            self.model = torch.compile(self.model, backend="aot_hpu_training_backend")
+            
+    def training_step(self, batch, batch_idx):
+        with torch.autocast(device_type=get_device_str(self.args), dtype=get_device_data_type(self.args), enabled=self.args.is_autocast):
+            img, lbl = self.get_train_data(batch)
+            if self.args.dataset == "brats": ###
+                img = img[:,:3]
+                lbl = lbl[:,0].long()
+            pred = self.model(img)
+            loss = self.compute_loss(pred, lbl)
+        # WA for https://github.com/Lightning-AI/lightning/issues/17251
+        # TBD: move to use of trochmetrics==v1.0.0 for following calc
+        if batch_idx  % self.args.progress_bar_refresh_rate == 0:
+            self.train_loss = torch.cat((torch.tensor([loss], device=self.train_loss.device), self.train_loss[:-1]))
+            if self.train_loss_valid_end < self.window_size:
+                self.train_loss_valid_end += 1
+                mask = (torch.arange(len(self.train_loss)) >= 0) & (torch.arange(len(self.train_loss)) <= self.train_loss_valid_end)
+                moving_average_loss = torch.mean(self.train_loss[mask])
+            else:
+                moving_average_loss = torch.mean(self.train_loss)
+            self.log("loss", moving_average_loss, prog_bar=True)
+        return loss
+            
+    def validation_step(self, batch, batch_idx):
+        with torch.autocast(device_type=get_device_str(self.args), dtype=get_device_data_type(self.args), enabled=self.args.is_autocast):
+            if os.getenv('framework') == 'NPT': #Pytorch and PTL compatibility
+                self.current_epoch = self.trainer.current_epoch
+            if self.current_epoch < self.args.skip_first_n_eval:
+                return None
+            img, lbl = batch["image"], batch["label"]
+            if self.args.hpus:
+                img, lbl = img.to(torch.device("hpu"), non_blocking=False), lbl.to(torch.device("hpu"), non_blocking=False)
+            if self.args.dataset == "brats": ###
+                img = img[:,:3]
+                lbl = lbl[:,0].long()
+            elif self.args.dataset == "kitti":
+                img, lbl = img.to(torch.float32), lbl.to(torch.int32)
+            pred = self.forward(img)
+            if self.args.dim == 3:
+                mark_step(self.args.run_lazy_mode)
+            #Calculating dice update before calculating loss as dice update has blocking calls of "if conditions" to fetch tensors to CPU
+            if self.args.dataset == "brats": ###
+                self.dice.update(pred, lbl[:, 0])
+            elif self.args.dataset == "kitti":
+                self.dice.update(pred, lbl[:, ..., 0])
+            loss = self.loss(pred, lbl)
+            mark_step(self.args.run_lazy_mode)
+            self.validation_step_outputs.append(loss)
+            return {"val_loss": loss}
+        
+    def inference2d(self, image):
+        batch_modulo = image.shape[2] % self.args.val_batch_size
+        if batch_modulo != 0:
+            batch_pad = self.args.val_batch_size - batch_modulo
+            image = nn.ConstantPad3d((0, 0, 0, 0, batch_pad, 0), 0)(image)
+            mark_step(self.args.run_lazy_mode)
+        image = torch.transpose(image.squeeze(0), 0, 1)
+        preds_shape = (image.shape[0], self.n_class, *image.shape[2:])
+        preds = torch.zeros(preds_shape, dtype=image.dtype, device=image.device)
+        for start in range(0, image.shape[0] - self.args.val_batch_size + 1, self.args.val_batch_size):
+            end = start + self.args.val_batch_size
+            pred = self.model(image[start:end])
+            preds[start:end] = pred.data
+            mark_step(self.args.run_lazy_mode)
+        if batch_modulo != 0:
+            preds = preds[batch_pad:]
+            mark_step(self.args.run_lazy_mode)
+        return torch.transpose(preds, 0, 1).unsqueeze(0)

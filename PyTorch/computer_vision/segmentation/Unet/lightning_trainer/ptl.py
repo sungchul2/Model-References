@@ -45,9 +45,9 @@ from lightning_habana.pytorch import HPUAccelerator
 from lightning_habana.pytorch.plugins import HPUPrecisionPlugin
 from lightning_habana.pytorch.strategies import HPUParallelStrategy, SingleHPUStrategy
 
-from models.nn_unet import NNUnet
+from models.nn_unet import NNUnet, LiteHRNet
 from utils.logger import LoggingCallback
-from data_loading.data_module import DataModule
+from data_loading.data_module import DataModule, LiteHRNetDataModule
 from utils.utils import  is_main_process, log, make_empty_dir, set_cuda_devices, verify_ckpt_path
 from utils.utils import set_seed, get_device
 from utils.early_stopping_unet import EarlyStopping
@@ -132,7 +132,11 @@ def ptlrun(args):
 
     seed_everything(seed0)
     set_seed(data_module_seed)
-    data_module = DataModule(args)
+    if args.dataset == "brats":
+        data_module = DataModule(args)
+    else:
+        data_module = LiteHRNetDataModule(args)
+        
     data_module.prepare_data()
     data_module.setup()
     ckpt_path = verify_ckpt_path(args)
@@ -158,7 +162,10 @@ def ptlrun(args):
             TQDMProgressBar(refresh_rate=args.progress_bar_refresh_rate)
         ]
     elif args.exec_mode == "train":
-        model = NNUnet(args)
+        if args.model == "unet":
+            model = NNUnet(args)
+        else:
+            model = LiteHRNet(args)
         callbacks = [EarlyStopping(monitor="dice_sum", patience=args.patience, verbose=True, mode="max"),
                         TQDMProgressBar(refresh_rate=args.progress_bar_refresh_rate)
         ]

@@ -21,6 +21,7 @@ from  utils.logger import LoggingCallback
 from models.unet import UNet
 from dataclasses import asdict, dataclass, field
 import torch.distributed as dist
+from models.metrics import Dice
 
 def main_process():
     return dist.get_rank() == 0
@@ -105,6 +106,8 @@ class Trainer:
         self.train_dataloaders=list()
         self.optimizer = None
         self.scheduler = None
+        
+        self.dice = Dice(19)
         pass
 
     def scheduler_step(self,val_loss):
@@ -120,62 +123,107 @@ class Trainer:
         pass
 
     def _implement_train(self, model:"NNUnet", hparams):
+        model.train()
+        train_losses = []
+        torch.set_grad_enabled(True)
 
-       model.train()
-       train_losses = []
-       torch.set_grad_enabled(True)
-
-       with tqdm(self.train_dataloaders[0],  unit="it", leave=True, position=0) as tepoch:
+        with tqdm(self.train_dataloaders[0],  unit="it", leave=True, position=0) as tepoch:
             for i, batch in enumerate(tepoch):
                 tepoch.set_description(f"Train Epoch {self.current_epoch}")
                 self.optimizer.zero_grad(set_to_none=True)
-                loss = model.training_step(batch, i)
-                loss.backward()
+                # loss = model.training_step(batch, i)
+                # loss.backward()
+                batch_size = batch["image"].shape[0]
+                with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=self.args.is_autocast):
+                    losses = model.forward_train(**{
+                        "img": batch["image"],
+                        "img_metas": [{
+                            'ori_shape': (375, 1241, 3),
+                            'pad_shape': (512, 512, 3),
+                            'ori_filename': 'Dataset item index 142',
+                            'filename': 'Dataset item index 142',
+                            'scale_factor': np.array([1., 1., 1., 1.], dtype=np.float32),
+                            'flip': True,
+                            'img_norm_cfg': {
+                                'mean': np.array([123.675, 116.28, 103.53], dtype=np.float32),
+                                'std': np.array([58.395, 57.12, 57.375], dtype=np.float32),
+                                'to_rgb': False
+                            },
+                            'flip_direction': 'horizontal',
+                            'ignored_labels': np.array([], dtype=np.float64),
+                            'img_shape': (512, 512, 3)
+                        } for _ in range(batch_size)],
+                        "gt_semantic_seg": batch["label"]
+                    })
+                    loss = losses.get("decode.loss_ce")
+
                 #gradient clipping improves training stability
-                if model.args.gradient_clip == True:
-                   torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), model.args.gradient_clip_norm)
-                mark_step(model.args.run_lazy_mode)
+                if hparams.args.gradient_clip == True:
+                    torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), hparams.args.gradient_clip_norm)
+                mark_step(hparams.args.run_lazy_mode)
                 self.optimizer.step()
-                mark_step(model.args.run_lazy_mode)
+                mark_step(hparams.args.run_lazy_mode)
                 train_losses.append(loss)
-       output_loss = torch.mean(torch.stack(train_losses), dim=0)
-       if main_process():
-           print(f"Rank: {dist.get_rank()}, Batch: {i}, Train Loss is: {output_loss:.3f}", end="\r")
-           print(flush=True)
-       return output_loss
+        output_loss = torch.mean(torch.stack(train_losses), dim=0)
+        if main_process():
+            print(f"Rank: {dist.get_rank()}, Batch: {i}, Train Loss is: {output_loss:.3f}", end="\r")
+            print(flush=True)
+        return output_loss
 
     def _implement_validate(self, model:"NNUnet", hparams:Optional[SimpleNamespace]=None):
-        val_losses = []
+        # val_dice = []
+        self.dice.reset()
         model.eval()
-        with torch.set_grad_enabled(False):
-            with tqdm(self.val_dataloaders[0], unit="it", leave=True, position=0) as tepoch:
-                for i, batch in enumerate(tepoch):
-                    tepoch.set_description(f"Validation Epoch {self.current_epoch}")
-                    loss = model.validation_step(batch, i)
-                    val_losses.append(loss)
-            output_loss = torch.mean(torch.stack([n['val_loss'] for n in val_losses]), dim = 0)
-            tepoch.set_postfix(loss=output_loss.item())
-        kwargs = model.validation_epoch_end(val_losses)
         if main_process():
-            output_loss_print = output_loss.item()
-            val_loss= kwargs['val_loss'].item()
-            dice_sum = kwargs['dice_sum'].item()
-            print(f"Rank: {dist.get_rank()}, Batch:{i}, Val Loss is: {output_loss_print:.3f}", end="\r")
-            print(f" val_loss {val_loss:.2f}")
-            print(f" dice_sum {dice_sum:.2f}")
+            with torch.set_grad_enabled(False):
+                with tqdm(self.val_dataloaders[0], unit="it", leave=True, position=0) as tepoch:
+                    for i, batch in enumerate(tepoch):
+                        tepoch.set_description(f"Validation Epoch {self.current_epoch}")
+                        # loss = model.validation_step(batch, i)
+                        with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=self.args.is_autocast):
+                            seg_pred = model.whole_inference(**{
+                                "img": batch["image"],
+                                "img_meta": [{
+                                    'ori_shape': (375, 1241, 3),
+                                    'pad_shape': (512, 512, 3),
+                                    'ori_filename': 'Dataset item index 142',
+                                    'filename': 'Dataset item index 142',
+                                    'scale_factor': np.array([1., 1., 1., 1.], dtype=np.float32),
+                                    'flip': False,
+                                    'img_norm_cfg': {
+                                        'mean': np.array([123.675, 116.28, 103.53], dtype=np.float32),
+                                        'std': np.array([58.395, 57.12, 57.375], dtype=np.float32),
+                                        'to_rgb': False
+                                    },
+                                    'ignored_labels': np.array([], dtype=np.float64),
+                                    'img_shape': (512, 512, 3)
+                                }],
+                                "rescale": True,
+                            })
+                        mark_step(hparams.args.run_lazy_mode)
+                        self.dice.update(torch.tensor(seg_pred[0], dtype=batch["label"].dtype).to(batch["label"].device), batch["label"].squeeze())
+                        # val_dice.append(dice)
+                output_dice = self.dice.compute()
+                tepoch.set_postfix(dice=output_dice)
+            # output_loss_print = output_loss.item()
+            # val_loss = kwargs['val_loss'].item()
+            # dice_sum = kwargs['dice_sum'].item()
+            print(f"Rank: {dist.get_rank()}, Batch:{i}, Val Dice is: {output_dice:.3f}", end="\r")
+            # print(f" val_loss {val_loss:.2f}")
+            # print(f" dice_sum {dice_sum:.2f}")
             print(flush=True)
-        return kwargs
+        return {"dice_sum": output_dice}
 
     def fit(self, model:"NNUnet", hparams) -> None:
             model.trainer = self
-            self.earlystopping =  EarlyStopping(monitor="dice_sum", patience=model.args.patience, verbose=True, mode="max")
+            self.earlystopping = EarlyStopping(monitor="dice_sum", patience=hparams.args.patience, verbose=True, mode="max")
             self.earlystopping.setup(self)
             self.optimizer = hparams.opt_dict['optimizer']
             self.scheduler = hparams.opt_dict['lr_scheduler'] if 'lr_scheduler' in  hparams.opt_dict else None
-
+            
             self.train_dataloaders.append(hparams.data_module.train_dataloader())
             self.val_dataloaders.append(hparams.data_module.val_dataloader())
-            for self.current_epoch in range(model.args.max_epochs):
+            for self.current_epoch in range(hparams.args.max_epochs):
                 time_1 = time.time()
                 train_output_loss = self._implement_train(model, hparams)
                 val_output = self._implement_validate(model, hparams)
@@ -244,4 +292,3 @@ class Trainer:
            log.info_log(stats)
            print(stats)
            print(flush=True)
-
